@@ -38,10 +38,14 @@ def get_decrypted_data(key, data):
     ciphertext = data[16:-16]
 
     cipher = AES.new(key, AES.MODE_GCM, nonce=nonce)
-    plaintext = cipher.decrypt_and_verify(ciphertext, tag)
 
-    return plaintext.decode()
+    try:
+        plaintext = cipher.decrypt_and_verify(ciphertext, tag)
+        return plaintext.decode()
+    except ValueError:
+        print("Received message is corrupted or key is invalid")
 
+    return "This message was currupted or key was invalid"
 
 def invoke_server(key, server_port):
     #Receive connection from client (Single client support for now)
