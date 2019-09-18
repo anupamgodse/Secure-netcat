@@ -1,4 +1,2 @@
 # Secure-netcat
 Secure netcat
-
-
