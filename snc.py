@@ -9,7 +9,7 @@ import threading
 from Crypto.Protocol.KDF import PBKDF2
 from Crypto.Hash import SHA512
 from Crypto.Random import get_random_bytes
-
+from Crypto.Cipher import AES
 
 INT_STR_LEN = 16
 
@@ -22,11 +22,26 @@ def get_fixed_sized_string(msg_len):
 
     return prepend + msg_len_str
 
-def get_encrypted_data(send_data):
-    return send_data
+def get_encrypted_data(key, data):
+    cipher = AES.new(key, AES.MODE_GCM)
+    ciphertext, tag = cipher.encrypt_and_digest(data.encode())
+    return ciphertext, tag, cipher.nonce
 
-def get_decrypted_data(recv_data):
-    return recv_data
+def get_decrypted_data(key, data):
+    #first 16 bytes in data are nonce
+    nonce = data[:16]
+
+    #last 16 bytes in data are tag
+    tag = data[-16:]
+
+    #remaining is the ciphertext
+    ciphertext = data[16:-16]
+
+    cipher = AES.new(key, AES.MODE_GCM, nonce=nonce)
+    plaintext = cipher.decrypt_and_verify(ciphertext, tag)
+
+    return plaintext.decode()
+
 
 def invoke_server(key, server_port):
     #Receive connection from client (Single client support for now)
@@ -54,88 +69,91 @@ def invoke_server(key, server_port):
     stdin_done = False
     already_closed = False
 
-    while not (client_done and stdin_done):
-        #print(client_done, stdin_done)
-        readable, writeable, exceptions = select.select(read_list, write_list, exception_list)
+    try:
+        while not (client_done and stdin_done):
+            #print(client_done, stdin_done)
+            readable, writeable, exceptions = select.select(read_list, write_list, exception_list)
 
-        for sock in readable:
-            #if server has data to send
-            if sock == sys.stdin:
-                #print("server stdin data")
-                send_data = sock.readline()
-                #print(len(send_data))
-                if send_data:
-                    final_send_data = get_fixed_sized_string(len(send_data)) + send_data
-                    outgoing_client.put(final_send_data)
-                    #print("data added to queue")
-                    if c not in write_list:
-                        write_list.append(c)
-                else:
-                    #print("Closing client")
-                    #print("server stdin done")
-                    read_list.remove(sys.stdin)
-                    stdin_done = True
-
-            #data from client
-            else:
-                #get msg length first
-                msg_len = sock.recv(INT_STR_LEN)
-
-                if msg_len:
-                    msg_len = int(msg_len.decode())
-
-                    #get actual msg
-                    total_received = 0
-                    to_receive = msg_len
-
-                    recv_data = b''
-                    while total_received < to_receive:
-                        recv_data_part = sock.recv(to_receive-total_received)
-                        recv_data += recv_data_part
-                        total_received += len(recv_data_part)
-
-                    recv_data = get_decrypted_data(recv_data)
-                    outgoing_stdout.put(recv_data.decode())
-                    if sys.stdout not in write_list:
-                        write_list.append(sys.stdout)
-                    #print("data added to queue")
-                else:
-                    read_list.remove(c)
-                    #print("client done")
-                    client_done = True
-                    if not select.select([sys.stdin,],[],[],0.0)[0]:
+            for sock in readable:
+                #if server has data to send
+                if sock == sys.stdin:
+                    #print("server stdin data")
+                    send_data = sock.readline()
+                    #print(len(send_data))
+                    if send_data:
+                        ciphertext, tag, nonce = get_encrypted_data(aes_key, send_data)
+                        final_send_data = get_fixed_sized_string(len(ciphertext) + len(tag) + len(nonce)).encode() + nonce + ciphertext + tag
+                        outgoing_client.put(final_send_data)
+                        #print("data added to queue")
+                        if c not in write_list:
+                            write_list.append(c)
+                    else:
+                        #print("Closing client")
+                        #print("server stdin done")
+                        read_list.remove(sys.stdin)
                         stdin_done = True
 
-        for sock in writeable:
-            if sock == sys.stdout:
-                while not outgoing_stdout.empty():
-                    #print("writing data to stdout")
-                    send_data = outgoing_stdout.get_nowait()
-                    sock.write(send_data)
-                    #print(send_data)
-            else:
-                while not outgoing_client.empty():
-                    #print("sending data to client")
-                    send_data = outgoing_client.get(False)
-                    send_data = get_encrypted_data(send_data)
-                    sock.sendall(send_data.encode())
+                #data from client
+                else:
+                    #get msg length first
+                    msg_len = sock.recv(INT_STR_LEN)
 
-            write_list.remove(sock)
+                    if msg_len:
+                        msg_len = int(msg_len.decode())
 
-        if stdin_done and not already_closed:
-            c.shutdown(socket.SHUT_WR)
-            already_closed = True
+                        #get actual msg
+                        total_received = 0
+                        to_receive = msg_len
 
-        for e in exceptions:
-            c.close()
-            s.close()
+                        recv_data = b''
+                        while total_received < to_receive:
+                            recv_data_part = sock.recv(to_receive-total_received)
+                            recv_data += recv_data_part
+                            total_received += len(recv_data_part)
 
-    #print("server closing sockets")
-    c.close()
-    s.close()
+                        recv_data = get_decrypted_data(aes_key, recv_data)
+                        outgoing_stdout.put(recv_data)
+                        if sys.stdout not in write_list:
+                            write_list.append(sys.stdout)
+                        #print("data added to queue")
+                    else:
+                        read_list.remove(c)
+                        #print("client done")
+                        client_done = True
+                        if not select.select([sys.stdin,],[],[],0.0)[0]:
+                            stdin_done = True
+
+            for sock in writeable:
+                if sock == sys.stdout:
+                    while not outgoing_stdout.empty():
+                        #print("writing data to stdout")
+                        send_data = outgoing_stdout.get_nowait()
+                        sock.write(send_data)
+                        #print(send_data)
+                else:
+                    while not outgoing_client.empty():
+                        #print("sending data to client")
+                        send_data = outgoing_client.get(False)
+                        sock.sendall(send_data)
+
+                write_list.remove(sock)
+
+            if stdin_done and not already_closed:
+                c.shutdown(socket.SHUT_WR)
+                already_closed = True
+
+            for e in exceptions:
+                c.close()
+                s.close()
+    except KeyboardInterrupt:
+        print("keyboard interrupt occured: exiting")
+    finally:
+        #print("server closing sockets")
+        c.close()
+        s.close()
 
 def invoke_client(key, server_ip, server_port):
-    #connect to the server 
+    #connect to the server
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     s.connect((server_ip, server_port))
 
@@ -157,85 +175,87 @@ def invoke_client(key, server_ip, server_port):
     server_done = False
     already_closed = False
 
-    while not (stdin_done and server_done):
-        #print(server_done, stdin_done)
-        readable, writeable, exceptions = select.select(read_list, write_list, exception_list)
+    try:
+        while not (stdin_done and server_done):
+            #print(server_done, stdin_done)
+            readable, writeable, exceptions = select.select(read_list, write_list, exception_list)
 
-        for sock in readable:
-            #if client has data to send
-            if sock == sys.stdin:
-                #print("client stdin data")
-                send_data = sock.readline()
-                #print(len(send_data))
-                if send_data:
-                    final_send_data = get_fixed_sized_string(len(send_data)) + send_data
-                    outgoing_server.put(final_send_data)
-                    if s not in write_list:
-                        write_list.append(s)
-                    #print("data added to queue")
-                else:
-                    #print("Client stdin done")
-                    read_list.remove(sys.stdin)
-                    stdin_done = True
-                    #s.shutdown(socket.SHUT_WR)
+            for sock in readable:
+                #if client has data to send
+                if sock == sys.stdin:
+                    #print("client stdin data")
+                    send_data = sock.readline()
+                    #print(len(send_data))
+                    if send_data:
+                        ciphertext, tag, nonce = get_encrypted_data(aes_key, send_data)
+                        final_send_data = get_fixed_sized_string(len(ciphertext) + len(tag) + len(nonce)).encode() + nonce + ciphertext + tag
 
-            #data from server
-            else:
-                #print("data from server")
-
-                #get msg len
-                msg_len = sock.recv(INT_STR_LEN)
-                if msg_len:
-                    msg_len = int(msg_len.decode())
-
-                    #get actual data
-                    total_received = 0
-                    to_receive = msg_len
-
-                    recv_data = b''
-                    while total_received < to_receive:
-                        recv_data_part = sock.recv(to_receive-total_received)
-                        recv_data += recv_data_part
-                        total_received += len(recv_data_part)
-
-                    recv_data = get_decrypted_data(recv_data)
-                    outgoing_stdout.put(recv_data.decode())
-                    if sys.stdout not in write_list:
-                        write_list.append(sys.stdout)
-                    #print("data added to queue")
-                else:
-                    #print("server_done")
-                    read_list.remove(s)
-                    server_done = True
-                    if not select.select([sys.stdin,],[],[],0.0)[0]:
+                        outgoing_server.put(final_send_data)
+                        if s not in write_list:
+                            write_list.append(s)
+                        #print("data added to queue")
+                    else:
+                        #print("Client stdin done")
+                        read_list.remove(sys.stdin)
                         stdin_done = True
+                        #s.shutdown(socket.SHUT_WR)
 
-        for sock in writeable:
-            if sock == sys.stdout:
-                while not outgoing_stdout.empty():
-                    #print("writing data to stdout")
-                    send_data = outgoing_stdout.get(False)
-                    sock.write(send_data)
-            else:
-                while not outgoing_server.empty():
-                    #print("sending data to server")
-                    send_data = outgoing_server.get(False)
-                    send_data = get_encrypted_data(send_data)
-                    sock.sendall(send_data.encode())
-                
-            write_list.remove(sock)
+                #data from server
+                else:
+                    #print("data from server")
 
-        if stdin_done and not already_closed:
-            s.shutdown(socket.SHUT_WR)
-            already_closed = True
+                    #get msg len
+                    msg_len = sock.recv(INT_STR_LEN)
+                    if msg_len:
+                        msg_len = int(msg_len.decode())
 
-        for e in exceptions:
-            #print("exception ", e)
-            s.close()
+                        #get actual data
+                        total_received = 0
+                        to_receive = msg_len
 
-    #print("client closing socket")
-    #s.shutdown(socket.SHUT_WR)
-    s.close()
+                        recv_data = b''
+                        while total_received < to_receive:
+                            recv_data_part = sock.recv(to_receive-total_received)
+                            recv_data += recv_data_part
+                            total_received += len(recv_data_part)
+
+                        recv_data = get_decrypted_data(aes_key, recv_data)
+                        outgoing_stdout.put(recv_data)
+                        if sys.stdout not in write_list:
+                            write_list.append(sys.stdout)
+                        #print("data added to queue")
+                    else:
+                        #print("server_done")
+                        read_list.remove(s)
+                        server_done = True
+                        if not select.select([sys.stdin,],[],[],0.0)[0]:
+                            stdin_done = True
+
+            for sock in writeable:
+                if sock == sys.stdout:
+                    while not outgoing_stdout.empty():
+                        #print("writing data to stdout")
+                        send_data = outgoing_stdout.get(False)
+                        sock.write(send_data)
+                else:
+                    while not outgoing_server.empty():
+                        #print("sending data to server")
+                        send_data = outgoing_server.get(False)
+                        sock.sendall(send_data)
+
+                write_list.remove(sock)
+
+            if stdin_done and not already_closed:
+                s.shutdown(socket.SHUT_WR)
+                already_closed = True
+
+            for e in exceptions:
+                #print("exception ", e)
+                s.close()
+    except KeyboardInterrupt:
+        print("keyboard interrupt occured: exiting")
+    finally:
+        s.close()
 
 #main function
 if __name__ == '__main__':
@@ -251,11 +271,8 @@ if __name__ == '__main__':
     is_listen = args.is_listen
     server_ip = args.server_ip
     server_port = args.server_port
-    
-    #print(key, is_listen, server_ip, server_port)
 
-
-    #Decision to invoke server of client on this machine
+    #Decision to invoke server or client on this machine
     if is_listen:
         #print("invoking server")
         invoke_server(key, server_port)
